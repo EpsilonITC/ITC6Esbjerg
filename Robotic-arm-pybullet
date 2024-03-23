@@ -1,0 +1,126 @@
+import pybullet as p
+import numpy as np
+import math
+import cv2
+import pybullet_data
+
+class PandaSim(object):
+    def __init__(self, bullet_client, offset):
+        self.bullet_client = bullet_client
+        self.offset = offset
+        
+        flags = self.bullet_client.URDF_ENABLE_CACHED_GRAPHICS_SHAPES
+        p.setGravity(0, 0, -9.81)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.loadURDF("plane.urdf")
+        
+        self.panda = self.bullet_client.loadURDF("franka_panda/panda.urdf", basePosition=[offset[0], offset[1], offset[2]], useFixedBase=True, flags=flags)
+        self.bullet_client.loadURDF("duck_vhacd.urdf", np.array([1.5, 0.6, 0])+self.offset, flags=flags)
+    
+        initial_joint_positions = [0, 0, 0, -math.pi/2, 0, math.pi/2, math.pi/4]
+        for joint_index, joint_position in enumerate(initial_joint_positions):
+            self.bullet_client.resetJointState(self.panda, joint_index, joint_position)
+    
+    def step(self):
+        pass
+
+    def capture_image(self):
+        gripper_pos = [1, 0, 0]  # Assuming fixed position for demonstration
+        camera_height = 1.75
+        camera_pos = [gripper_pos[0], gripper_pos[1], gripper_pos[2] + camera_height]
+        camera_target = gripper_pos
+        camera_up_vector = [0, 1, 0]
+        
+        view_matrix = self.bullet_client.computeViewMatrix(camera_pos, camera_target, camera_up_vector)
+        projection_matrix = self.bullet_client.computeProjectionMatrixFOV(fov=60.0, aspect=1.0, nearVal=0.1, farVal=100.0)
+        width, height, rgb_img_data, _, seg_img_data = self.bullet_client.getCameraImage(
+        width=224, height=224, viewMatrix=view_matrix, projectionMatrix=projection_matrix, renderer=self.bullet_client.ER_BULLET_HARDWARE_OPENGL)
+    
+        rgb_img = np.array(rgb_img_data, dtype=np.uint8).reshape((height, width, 4))[:, :, :3]  # Drop the alpha channel
+        seg_img = np.array(seg_img_data, dtype=np.uint8).reshape((height, width))  # Segmentation image
+        
+        return rgb_img, seg_img
+
+    def process_image(self, rgb_img, seg_img):
+        duck_id = 2  # Replace with the correct ID for the duck in the segmentation mask
+        duck_mask = seg_img == duck_id
+        contours, _ = cv2.findContours(duck_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        rgb_img = np.ascontiguousarray(rgb_img)
+
+
+        if not contours:
+            print("No duck contours found!")
+            return None
+
+        # Assuming the duck is the largest object of its color
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        
+        try:
+            cv2.rectangle(rgb_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        except cv2.error as e:
+            print(f"OpenCV error when drawing rectangle: {e}")
+        
+        box_center_x = x + w // 2
+        box_center_y = y + h // 2
+        world_x, world_y = self.image_to_world(box_center_x, box_center_y)
+
+        print(f"Rubber duck bounding box center at image coordinates: ({box_center_x}, {box_center_y})")
+        print(f"Rubber duck bounding box center at world coordinates: ({world_x}, {world_y})")
+        
+        cv2.imshow("Image with bounding box", rgb_img)
+        cv2.waitKey(1) & 0xFF
+        
+        return [("rubber_duck", (box_center_x, box_center_y))]
+
+    def image_to_world(self, x_i, y_i):
+        image_width, image_height = 224, 224  # Camera image dimensions
+        visible_area_side = 2  # Side length of the visible area in world units
+        camera_pos = [1, 0, 1.75]  # Camera position in world coordinates
+        
+        x_normalized = x_i / image_width
+        y_normalized = y_i / image_height
+        
+        x_w = (x_normalized * visible_area_side) + (camera_pos[0] - visible_area_side / 2)
+        y_w = -((y_normalized * visible_area_side) - visible_area_side / 2 + camera_pos[1])
+
+        return x_w, y_w
+
+    def process_and_map_image(self, rgb_img, seg_img):
+        object_data = self.process_image(rgb_img, seg_img)
+        world_coordinates = []
+
+        if object_data is not None:
+            for obj_name, (x_i, y_i) in object_data:
+                x_w, y_w = self.image_to_world(x_i, y_i)
+                world_coordinates.append((obj_name, (x_w, y_w)))
+                print(f"Found {obj_name} at image coordinates ({x_i}, {y_i}), which maps to world coordinates ({x_w}, {y_w})")
+
+        return world_coordinates
+
+if __name__ == "__main__":
+    physicsClient = p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())  # Optionally set path to your URDFs
+
+    pandaSim = PandaSim(p, [0, 0, 0])
+
+    while True:
+        rgb_image, seg_image = pandaSim.capture_image()
+        objects_world_coordinates = pandaSim.process_and_map_image(rgb_image, seg_image)
+        
+        if objects_world_coordinates:
+            for obj_name, (x_w, y_w) in objects_world_coordinates:
+                print(f"Object {obj_name} is at world coordinates ({x_w}, {y_w})")
+        else:
+            print("No objects detected.")
+
+        action = input("Press Enter to continue...")  # Pause for input
+        if action.lower() == 'exit':
+            break
+
+        pandaSim.step()
+        p.stepSimulation()
+
+    cv2.destroyAllWindows()
+    p.disconnect()
